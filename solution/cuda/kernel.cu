@@ -7,7 +7,7 @@ using namespace cute;
 using T_FP8 = cutlass::float_e4m3_t;
 
 // -----------------------------------------------------------------------------
-// Kernel: Vectorized & Shared Memory Optimized
+// Kernel: Vectorized, Shared Memory, and Unrolled
 // -----------------------------------------------------------------------------
 __global__ void dsa_cute_kernel(
     const T_FP8* __restrict__ q_ptr,           // [B, H, D]
@@ -25,21 +25,19 @@ __global__ void dsa_cute_kernel(
     int b = blockIdx.y;
     int tid = threadIdx.x;
 
-    // 1. Bounds Check
     if (page_idx_in_seq * page_size >= seq_lens[b]) return;
 
     int physical_page_id = block_table[b * max_num_pages + page_idx_in_seq];
 
-    // 2. Shared Memory for K Page
-    // Size: 64 tokens * 128 dim = 8192 bytes
+    // 8KB Shared Memory for K Page
     __shared__ uint8_t smem_k_bytes[64 * 128];
 
-    // 3. Global Pointers
+    // Pointers
     const T_FP8* gmem_k_start = k_cache_ptr + physical_page_id * (64 * 128);
     const T_FP8* gmem_q_start = q_ptr + b * (num_heads * 128);
     const float* w_vec = weights_ptr + b * num_heads;
 
-    // 4. Load K -> SMEM (Vectorized 128-bit Copy)
+    // Load K -> SMEM (128-bit Vectorized Copy)
     const int4* k_in_int4 = reinterpret_cast<const int4*>(gmem_k_start);
     int4* k_smem_int4 = reinterpret_cast<int4*>(smem_k_bytes);
 
@@ -53,8 +51,8 @@ __global__ void dsa_cute_kernel(
 
     __syncthreads();
 
-    // 5. Compute Dot Product
-    // Each thread handles ONE token row of K (0..63)
+    // Compute Dot Product
+    // Each thread handles ONE token row
     if (tid < 64) {
         int token_idx = tid;
         float final_score = 0.0f;
@@ -62,20 +60,21 @@ __global__ void dsa_cute_kernel(
         T_FP8* smem_k = reinterpret_cast<T_FP8*>(smem_k_bytes);
         const T_FP8* k_tok_ptr = smem_k + token_idx * 128;
 
+        #pragma unroll 4
         for (int h = 0; h < num_heads; ++h) {
             float dot = 0.0f;
             const T_FP8* q_head_ptr = gmem_q_start + h * 128;
 
-            // Vectorized Compute (16 elems at a time)
             const int4* q_int4 = reinterpret_cast<const int4*>(q_head_ptr);
             const int4* k_int4 = reinterpret_cast<const int4*>(k_tok_ptr);
 
+            // Inner Loop: 128 dimensions / 16 per step = 8 steps
+            // Fully unroll this to keep pipeline full
             #pragma unroll
-            for (int k_blk = 0; k_blk < (128/16); ++k_blk) {
+            for (int k_blk = 0; k_blk < 8; ++k_blk) {
                 int4 q_pack = q_int4[k_blk];
                 int4 k_pack = k_int4[k_blk];
 
-                // Reinterpret as bytes to extract FP8 values
                 uint8_t q_bytes[16];
                 uint8_t k_bytes[16];
                 *(int4*)q_bytes = q_pack;
@@ -89,21 +88,16 @@ __global__ void dsa_cute_kernel(
                 }
             }
 
-            // Fused Activation + Weighted Sum
-            float val = fmaxf(0.0f, dot); // ReLU
+            float val = fmaxf(0.0f, dot);
             final_score += val * w_vec[h];
         }
 
-        // 6. Write Result
         int global_token_idx = page_idx_in_seq * page_size + token_idx;
         long out_idx = (long)b * (max_num_pages * page_size) + global_token_idx;
         output_scores[out_idx] = final_score;
     }
 }
 
-// -----------------------------------------------------------------------------
-// Launcher
-// -----------------------------------------------------------------------------
 void dsa_topk_indexer(
     torch::Tensor q,
     torch::Tensor k,
@@ -119,12 +113,10 @@ void dsa_topk_indexer(
     int max_num_pages = block_table.size(1);
     int topk = topk_indices.size(1);
 
-    // Temp buffer for scores (B, MaxTokens)
     int max_tokens = max_num_pages * page_size;
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
     torch::Tensor all_scores = torch::full({b, max_tokens}, -1e9, options);
 
-    // Launch Kernel
     dim3 grid(max_num_pages, b);
     dim3 block(128);
 
@@ -141,14 +133,10 @@ void dsa_topk_indexer(
         max_num_pages
     );
 
-    // Perform TopK Selection using PyTorch (Highly optimized)
     auto result = torch::topk(all_scores, topk, 1, true, true);
-
-    // Extract indices (element 1 of tuple)
     topk_indices.copy_(std::get<1>(result).to(torch::kInt32));
 }
 
-// PyBind Definition
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dsa_topk_indexer", &dsa_topk_indexer, "DSA TopK Indexer");
 }
