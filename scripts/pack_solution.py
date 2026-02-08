@@ -1,11 +1,10 @@
 """
 Pack solution source files into solution.json.
-
-Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
+(Patched for Windows + generic Pydantic support)
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Add project root to path for imports
@@ -17,9 +16,8 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
-
+# Remove 'Source' from import to avoid ImportError
+from flashinfer_bench import BuildSpec, Solution
 
 def load_config() -> dict:
     """Load configuration from config.toml."""
@@ -30,9 +28,8 @@ def load_config() -> dict:
     with open(config_path, "rb") as f:
         return tomllib.load(f)
 
-
 def pack_solution(output_path: Path = None) -> Path:
-    """Pack solution files into a Solution JSON."""
+    """Pack solution files into a Solution JSON manually."""
     config = load_config()
 
     solution_config = config["solution"]
@@ -41,7 +38,7 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
+    # Determine source directory
     if language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
@@ -52,55 +49,45 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
+    # Create Build Spec
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
     )
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
+    # Read Files into List of Dictionaries
+    # Pydantic will convert these dicts to the internal Source model automatically
+    sources = []
+    for root, _, filenames in os.walk(source_dir):
+        for filename in filenames:
+            file_path = Path(root) / filename
+            rel_path = file_path.relative_to(source_dir).as_posix()
+            content = file_path.read_text(encoding="utf-8")
+
+            # Use a dictionary instead of the Source object
+            sources.append({
+                "path": rel_path,
+                "content": content
+            })
+
+    # Create Solution Object
+    solution = Solution(
         name=solution_config["name"],
         definition=solution_config["definition"],
         author=solution_config["author"],
+        spec=spec,
+        sources=sources
     )
 
-    # Write to output file
+    # Write Output
     if output_path is None:
         output_path = PROJECT_ROOT / "solution.json"
 
     output_path.write_text(solution.model_dump_json(indent=2))
     print(f"Solution packed: {output_path}")
-    print(f"  Name: {solution.name}")
-    print(f"  Definition: {solution.definition}")
-    print(f"  Author: {solution.author}")
-    print(f"  Language: {language}")
 
     return output_path
 
-
-def main():
-    """Entry point for pack_solution script."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Pack solution files into solution.json")
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        default=None,
-        help="Output path for solution.json (default: ./solution.json)"
-    )
-    args = parser.parse_args()
-
-    try:
-        pack_solution(args.output)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    pack_solution()

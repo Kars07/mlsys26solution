@@ -1,8 +1,8 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "sparse_attention"          # Track: fused_moe | sparse_attention | gated_delta_net
+name = "blackwell_dsa_indexer"      # Solution name
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "Raphael Eniaiyejuni"              # Team/author name
 
 [build]
 language = "cuda"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+entry_point = "binding.py::dsa_topk_indexer"            # Kernel function name
