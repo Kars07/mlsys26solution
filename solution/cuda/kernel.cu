@@ -31,7 +31,6 @@ __global__ void dsa_cute_kernel(
     int physical_page_id = block_table[b * max_num_pages + page_idx_in_seq];
 
     // 2. Shared Memory for K Page
-    // We treat this as a byte array to avoid constructor overhead issues
     // Size: 64 tokens * 128 dim = 8192 bytes
     __shared__ uint8_t smem_k_bytes[64 * 128];
 
@@ -41,9 +40,6 @@ __global__ void dsa_cute_kernel(
     const float* w_vec = weights_ptr + b * num_heads;
 
     // 4. Load K -> SMEM (Vectorized 128-bit Copy)
-    // Each thread loads int4 (16 bytes) at a time.
-    // 128 threads * 16 bytes = 2048 bytes per step.
-    // 8192 bytes / 2048 = 4 steps.
     const int4* k_in_int4 = reinterpret_cast<const int4*>(gmem_k_start);
     int4* k_smem_int4 = reinterpret_cast<int4*>(smem_k_bytes);
 
@@ -58,13 +54,11 @@ __global__ void dsa_cute_kernel(
     __syncthreads();
 
     // 5. Compute Dot Product
-    // Strategy: Each thread handles ONE token row of K (0..63)
-    // Threads 64..127 are idle in this specific setup (could be used for double buffering later)
+    // Each thread handles ONE token row of K (0..63)
     if (tid < 64) {
         int token_idx = tid;
         float final_score = 0.0f;
 
-        // Pointers for this token in SMEM
         T_FP8* smem_k = reinterpret_cast<T_FP8*>(smem_k_bytes);
         const T_FP8* k_tok_ptr = smem_k + token_idx * 128;
 
@@ -89,7 +83,6 @@ __global__ void dsa_cute_kernel(
 
                 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    // Convert FP8 (e4m3) bits -> float
                     T_FP8 q_val; q_val.storage = q_bytes[i];
                     T_FP8 k_val; k_val.storage = k_bytes[i];
                     dot += float(q_val) * float(k_val);
@@ -101,7 +94,7 @@ __global__ void dsa_cute_kernel(
             final_score += val * w_vec[h];
         }
 
-        // 6. Write Result to Global Memory
+        // 6. Write Result
         int global_token_idx = page_idx_in_seq * page_size + token_idx;
         long out_idx = (long)b * (max_num_pages * page_size) + global_token_idx;
         output_scores[out_idx] = final_score;
@@ -132,7 +125,6 @@ void dsa_topk_indexer(
     torch::Tensor all_scores = torch::full({b, max_tokens}, -1e9, options);
 
     // Launch Kernel
-    // Grid covers all pages. Block size 128 fits standard GPU scheduling well.
     dim3 grid(max_num_pages, b);
     dim3 block(128);
 
