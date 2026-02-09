@@ -25,10 +25,10 @@ __global__ void __launch_bounds__(128) dsa_cute_kernel(
     int b = blockIdx.y;
     int tid = threadIdx.x;
 
-    // 1. Bounds Check
+    // Bounds Check
     if (page_idx_in_seq * page_size >= seq_lens[b]) return;
 
-    // 2. Load K Page to Shared Memory
+    // Load K Page to Shared Memory
     extern __shared__ uint8_t smem_k_bytes[];
 
     int physical_page_id = block_table[b * max_num_pages + page_idx_in_seq];
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(128) dsa_cute_kernel(
 
     __syncthreads();
 
-    // 3. Compute Dot Product (Split-Head Optimization)
+    // Compute Dot Product (Split-Head Optimization)
     // tid 0-63   -> Heads 0-31
     // tid 64-127 -> Heads 32-63
 
@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(128) dsa_cute_kernel(
         partial_score += val * w_vec[h];
     }
 
-    // 4. Parallel Reduction (Warp Shuffle - Faster than SMEM)
+    // Parallel Reduction (Warp Shuffle - Faster than SMEM)
     // Reduce partial scores from the two thread groups
     float other_half_score = __shfl_down_sync(0xFFFFFFFF, partial_score, 64);
 
