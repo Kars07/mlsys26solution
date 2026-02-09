@@ -1,7 +1,3 @@
-//------------------------------------------------------------------------------
-// 1. KERNEL SOURCE (Double Buffered + Vectorized Indices)
-//------------------------------------------------------------------------------
-
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -12,8 +8,8 @@ constexpr int HEAD_DIM_KPE = 64;
 constexpr int NUM_Q_HEADS = 16;
 constexpr int TILE_SIZE = 64;
 constexpr int WARP_SIZE = 32;
-constexpr int ITEMS_PER_THREAD_CKV = HEAD_DIM_CKV / WARP_SIZE; // 16
-constexpr int ITEMS_PER_THREAD_KPE = HEAD_DIM_KPE / WARP_SIZE; // 2
+constexpr int ITEMS_PER_THREAD_CKV = HEAD_DIM_CKV / WARP_SIZE;
+constexpr int ITEMS_PER_THREAD_KPE = HEAD_DIM_KPE / WARP_SIZE;
 
 using bfloat16 = __nv_bfloat16;
 
@@ -36,7 +32,6 @@ __global__ void __launch_bounds__(256) dsa_attention_kernel(
     int heads_per_warp = 2;
     int h_start = warp_id * heads_per_warp;
 
-    // Shared Memory Setup (Double Buffer)
     extern __shared__ char smem_buffer[];
 
     int32_t* smem_indices[2];
@@ -51,11 +46,9 @@ __global__ void __launch_bounds__(256) dsa_attention_kernel(
     smem_k_nope[1] = (bfloat16*)(smem_indices[1] + TILE_SIZE);
     smem_k_pe[1] = smem_k_nope[1] + (TILE_SIZE * HEAD_DIM_CKV);
 
-    // Registers
     bfloat16 qn_reg[2][ITEMS_PER_THREAD_CKV];
     bfloat16 qp_reg[2][ITEMS_PER_THREAD_KPE];
 
-    // Load Q
     #pragma unroll
     for(int h=0; h<heads_per_warp; ++h) {
         int global_head = h_start + h;
@@ -79,12 +72,9 @@ __global__ void __launch_bounds__(256) dsa_attention_kernel(
     int next_stage = 1;
     int total_int4_gather = (TILE_SIZE * (HEAD_DIM_CKV + HEAD_DIM_KPE)) * sizeof(bfloat16) / 16;
 
-    // PROLOGUE
     {
         int t = 0;
         int base_k_idx = t * TILE_SIZE;
-
-        // --- VECTORIZED INDEX LOAD ---
         if (tid < TILE_SIZE / 4) {
             int4* idx_src = (int4*)(indices + token_idx * topk + base_k_idx);
             int4* idx_dst = (int4*)smem_indices[cur_stage];
@@ -106,7 +96,6 @@ __global__ void __launch_bounds__(256) dsa_attention_kernel(
             int vec_idx = i / stride;
             int offset = i % stride;
             int global_k_id = smem_indices[cur_stage][vec_idx];
-
             if (global_k_id != -1) {
                 void* src = (offset < 64)
                     ? (void*)(ckv_cache + (long)global_k_id * HEAD_DIM_CKV + offset * 8)
@@ -120,11 +109,9 @@ __global__ void __launch_bounds__(256) dsa_attention_kernel(
         __pipeline_commit();
     }
 
-    // MAIN LOOP
     for (int t = 0; t < num_tiles; ++t) {
         if (t + 1 < num_tiles) {
             int base_k_next = (t + 1) * TILE_SIZE;
-
             if (tid < TILE_SIZE / 4) {
                 int4* idx_src = (int4*)(indices + token_idx * topk + base_k_next);
                 int4* idx_dst = (int4*)smem_indices[next_stage];
@@ -214,9 +201,7 @@ void dsa_attention(torch::Tensor qn, torch::Tensor qp, torch::Tensor ckv, torch:
     int num_tokens = qn.size(0);
     int topk = idx.size(1);
     int smem_bytes = 150000;
-
     cudaFuncSetAttribute(dsa_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-
     dsa_attention_kernel<<<num_tokens, 256, smem_bytes>>>(
         (bfloat16*)qn.data_ptr(), (bfloat16*)qp.data_ptr(),
         (bfloat16*)ckv.data_ptr(), (bfloat16*)kpe.data_ptr(),
