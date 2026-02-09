@@ -7,9 +7,9 @@ using namespace cute;
 using T_FP8 = cutlass::float_e4m3_t;
 
 // -----------------------------------------------------------------------------
-// Kernel: Vectorized, Shared Memory, and Unrolled
+// Kernel: Split-Head Parallelism
 // -----------------------------------------------------------------------------
-__global__ void dsa_cute_kernel(
+__global__ void __launch_bounds__(128) dsa_cute_kernel(
     const T_FP8* __restrict__ q_ptr,           // [B, H, D]
     const T_FP8* __restrict__ k_cache_ptr,     // [TotalPages, PageSize, D]
     const float* __restrict__ weights_ptr,     // [B, H]
@@ -25,22 +25,18 @@ __global__ void dsa_cute_kernel(
     int b = blockIdx.y;
     int tid = threadIdx.x;
 
+    // 1. Bounds Check
     if (page_idx_in_seq * page_size >= seq_lens[b]) return;
 
+    // 2. Load K Page to Shared Memory
+    extern __shared__ uint8_t smem_k_bytes[];
+
     int physical_page_id = block_table[b * max_num_pages + page_idx_in_seq];
-
-    // 8KB Shared Memory for K Page
-    __shared__ uint8_t smem_k_bytes[64 * 128];
-
-    // Pointers
     const T_FP8* gmem_k_start = k_cache_ptr + physical_page_id * (64 * 128);
-    const T_FP8* gmem_q_start = q_ptr + b * (num_heads * 128);
-    const float* w_vec = weights_ptr + b * num_heads;
-
-    // Load K -> SMEM (128-bit Vectorized Copy)
     const int4* k_in_int4 = reinterpret_cast<const int4*>(gmem_k_start);
     int4* k_smem_int4 = reinterpret_cast<int4*>(smem_k_bytes);
 
+    // All 128 threads load data (Vectorized)
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         int offset = i * blockDim.x + tid;
@@ -51,47 +47,62 @@ __global__ void dsa_cute_kernel(
 
     __syncthreads();
 
-    // Compute Dot Product
-    // Each thread handles ONE token row
-    if (tid < 64) {
-        int token_idx = tid;
-        float final_score = 0.0f;
+    // 3. Compute Dot Product (Split-Head Optimization)
+    // tid 0-63   -> Heads 0-31
+    // tid 64-127 -> Heads 32-63
 
-        T_FP8* smem_k = reinterpret_cast<T_FP8*>(smem_k_bytes);
-        const T_FP8* k_tok_ptr = smem_k + token_idx * 128;
+    int token_idx = tid % 64;
+    int head_group = tid / 64;
+    int heads_per_group = num_heads / 2;
+    int start_head = head_group * heads_per_group;
+    int end_head = start_head + heads_per_group;
 
-        #pragma unroll 4
-        for (int h = 0; h < num_heads; ++h) {
-            float dot = 0.0f;
-            const T_FP8* q_head_ptr = gmem_q_start + h * 128;
+    T_FP8* smem_k = reinterpret_cast<T_FP8*>(smem_k_bytes);
+    const T_FP8* k_tok_ptr = smem_k + token_idx * 128;
+    const T_FP8* gmem_q_batch = q_ptr + b * (num_heads * 128);
+    const float* w_vec = weights_ptr + b * num_heads;
 
-            const int4* q_int4 = reinterpret_cast<const int4*>(q_head_ptr);
-            const int4* k_int4 = reinterpret_cast<const int4*>(k_tok_ptr);
+    float partial_score = 0.0f;
 
-            // Inner Loop: 128 dimensions / 16 per step = 8 steps
-            // Fully unroll this to keep pipeline full
+    #pragma unroll 4
+    for (int h = start_head; h < end_head; ++h) {
+        float dot = 0.0f;
+        const T_FP8* q_head_ptr = gmem_q_batch + h * 128;
+
+        const int4* q_int4 = reinterpret_cast<const int4*>(q_head_ptr);
+        const int4* k_int4 = reinterpret_cast<const int4*>(k_tok_ptr);
+
+        // Vectorized Math (16 elems at a time)
+        #pragma unroll
+        for (int k_blk = 0; k_blk < 8; ++k_blk) {
+            int4 q_pack = q_int4[k_blk];
+            int4 k_pack = k_int4[k_blk];
+
+            // Reinterpret bits as bytes
+            uint8_t q_bytes[16];
+            uint8_t k_bytes[16];
+            *(int4*)q_bytes = q_pack;
+            *(int4*)k_bytes = k_pack;
+
             #pragma unroll
-            for (int k_blk = 0; k_blk < 8; ++k_blk) {
-                int4 q_pack = q_int4[k_blk];
-                int4 k_pack = k_int4[k_blk];
-
-                uint8_t q_bytes[16];
-                uint8_t k_bytes[16];
-                *(int4*)q_bytes = q_pack;
-                *(int4*)k_bytes = k_pack;
-
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    T_FP8 q_val; q_val.storage = q_bytes[i];
-                    T_FP8 k_val; k_val.storage = k_bytes[i];
-                    dot += float(q_val) * float(k_val);
-                }
+            for (int i = 0; i < 16; ++i) {
+                T_FP8 q_val; q_val.storage = q_bytes[i];
+                T_FP8 k_val; k_val.storage = k_bytes[i];
+                dot += float(q_val) * float(k_val);
             }
-
-            float val = fmaxf(0.0f, dot);
-            final_score += val * w_vec[h];
         }
 
+        // Fused Activation
+        float val = fmaxf(0.0f, dot);
+        partial_score += val * w_vec[h];
+    }
+
+    // 4. Parallel Reduction (Warp Shuffle - Faster than SMEM)
+    // Reduce partial scores from the two thread groups
+    float other_half_score = __shfl_down_sync(0xFFFFFFFF, partial_score, 64);
+
+    if (tid < 64) {
+        float final_score = partial_score + other_half_score;
         int global_token_idx = page_idx_in_seq * page_size + token_idx;
         long out_idx = (long)b * (max_num_pages * page_size) + global_token_idx;
         output_scores[out_idx] = final_score;
@@ -119,8 +130,9 @@ void dsa_topk_indexer(
 
     dim3 grid(max_num_pages, b);
     dim3 block(128);
+    int smem_size = 8192;
 
-    dsa_cute_kernel<<<grid, block>>>(
+    dsa_cute_kernel<<<grid, block, smem_size>>>(
         (const T_FP8*)q.data_ptr(),
         (const T_FP8*)k.data_ptr(),
         weights.data_ptr<float>(),
